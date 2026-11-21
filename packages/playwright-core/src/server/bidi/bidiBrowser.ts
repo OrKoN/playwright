@@ -90,6 +90,10 @@ export class BidiBrowser extends Browser {
       dataTypes: [bidi.Network.DataType.Response],
       maxEncodedDataSize: 20_000_000, // same default as in CDP: https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/inspector/inspector_network_agent.cc;l=134;drc=4128411589187a396829a827f59a655bed876aa7
     });
+    await browser._browserSession.sendMayFail('network.addDataCollector', {
+      dataTypes: [bidi.Network.DataType.Request],
+      maxEncodedDataSize: 20_000_000,
+    });
 
     if (options.persistent) {
       const context = new BidiBrowserContext(browser, undefined, options.persistent);

@@ -33,6 +33,7 @@ const REQUEST_BODY_HEADERS = new Set(['content-encoding', 'content-language', 'c
 export class BidiNetworkManager {
   private readonly _session: BidiSession;
   private readonly _requests: Map<string, BidiRequest>;
+  private readonly _requestQueues = new Map<string, Promise<void>>();
   private readonly _page: Page;
   private readonly _eventListeners: RegisteredListener[];
   private _userRequestInterceptionEnabled: boolean = false;
@@ -59,7 +60,31 @@ export class BidiNetworkManager {
     eventsHelper.removeEventListeners(this._eventListeners);
   }
 
+  private _enqueueForRequest(requestId: string, handler: () => Promise<void> | void) {
+    const prev = this._requestQueues.get(requestId);
+    if (!prev) {
+      const result = handler();
+      if (result) {
+        const tracked = result.finally(() => {
+          if (this._requestQueues.get(requestId) === tracked)
+            this._requestQueues.delete(requestId);
+        });
+        this._requestQueues.set(requestId, tracked);
+      }
+      return;
+    }
+    const next = prev.then(() => handler()).finally(() => {
+      if (this._requestQueues.get(requestId) === next)
+        this._requestQueues.delete(requestId);
+    });
+    this._requestQueues.set(requestId, next);
+  }
+
   private _onBeforeRequestSent(param: bidi.Network.BeforeRequestSentParameters) {
+    this._enqueueForRequest(param.request.request, () => this._handleBeforeRequestSent(param));
+  }
+
+  private _handleBeforeRequestSent(param: bidi.Network.BeforeRequestSentParameters): Promise<void> | void {
     if (param.request.url.startsWith('data:'))
       return;
     const redirectedFrom = param.redirectCount ? (this._requests.get(param.request.request) || null) : null;
@@ -119,12 +144,30 @@ export class BidiNetworkManager {
         route = new BidiRouteImpl(this._session, param.request.request);
       }
     }
-    const request = new BidiRequest(frame, redirectedFrom, param, route, headersOverride);
-    this._requests.set(request._id, request);
-    this._page.frameManager.requestStarted(request.request, route);
+    const finish = (postDataBuffer: Buffer | null) => {
+      const request = new BidiRequest(frame, redirectedFrom, param, route, headersOverride, postDataBuffer);
+      this._requests.set(request._id, request);
+      this._page.frameManager.requestStarted(request.request, route);
+    };
+    if (param.request.bodySize) {
+      return this._session.sendMayFail('network.getData', {
+        request: param.request.request,
+        dataType: bidi.Network.DataType.Request,
+      }).then(result => {
+        let postDataBuffer: Buffer | null = null;
+        if (result?.bytes)
+          postDataBuffer = Buffer.from(result.bytes.value, result.bytes.type === 'base64' ? 'base64' : 'utf8');
+        finish(postDataBuffer);
+      });
+    }
+    finish(null);
   }
 
   private _onResponseStarted(params: bidi.Network.ResponseStartedParameters) {
+    this._enqueueForRequest(params.request.request, () => this._handleResponseStarted(params));
+  }
+
+  private _handleResponseStarted(params: bidi.Network.ResponseStartedParameters) {
     const request = this._requests.get(params.request.request);
     if (!request)
       return;
@@ -161,6 +204,10 @@ export class BidiNetworkManager {
   }
 
   private _onResponseCompleted(params: bidi.Network.ResponseCompletedParameters) {
+    this._enqueueForRequest(params.request.request, () => this._handleResponseCompleted(params));
+  }
+
+  private _handleResponseCompleted(params: bidi.Network.ResponseCompletedParameters) {
     const request = this._requests.get(params.request.request);
     if (!request)
       return;
@@ -183,6 +230,10 @@ export class BidiNetworkManager {
   }
 
   private _onFetchError(params: bidi.Network.FetchErrorParameters) {
+    this._enqueueForRequest(params.request.request, () => this._handleFetchError(params));
+  }
+
+  private _handleFetchError(params: bidi.Network.FetchErrorParameters) {
     const request = this._requests.get(params.request.request);
     if (!request)
       return;
@@ -289,13 +340,12 @@ class BidiRequest {
     redirectedFrom: BidiRequest | null,
     payload: bidi.Network.BeforeRequestSentParameters,
     route: BidiRouteImpl | undefined,
-    headersOverride: types.HeadersArray | undefined
+    headersOverride: types.HeadersArray | undefined,
+    postDataBuffer: Buffer | null
   ) {
     this._id = payload.request.request;
     if (redirectedFrom)
       redirectedFrom._redirectedTo = this;
-    // TODO: missing in the spec?
-    const postDataBuffer = null;
     this.request = new network.Request(frame._page.browserContext, frame, null, redirectedFrom ? redirectedFrom.request : null, payload.navigation ?? undefined,
         payload.request.url, resourceTypeFromBidi(payload.request.destination, payload.request.initiatorType, payload.initiator?.type), payload.request.method,
         postDataBuffer, headersOverride || fromBidiHeaders(payload.request.headers), payload.timestamp);
